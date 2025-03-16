@@ -6,7 +6,6 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "./BridgeTestMessenger.sol";
 import "./BridgeTestInterface.sol";
 import "./union/apps/Base.sol";
-import "./union/core/25-handler/IBCHandler.sol";
 
 import "./ZkgmLib.sol";
 
@@ -14,23 +13,38 @@ import "./ZkgmLib.sol";
  * @title BridgeTest
  * @notice This contract is only for testing purposes and does not represent the actual Bridge contract. Therefore, it is not advised to use it in production.
  */
-contract BridgeTest is BridgeTestInterface, BridgeTestMessenger, Ownable {
+contract BridgeTest is BridgeTestInterface, Ownable {
     IWETH9 public immutable WETH;
     using ZkgmLib for *;
     uint256 public fee = 100; // 1%
     address public feeReceiver = 0xBdc3f1A02e56CD349d10bA8D2B038F774ae22731;
     bytes public targetContract;
+    bytes public sourceContract;
+    address public ibcHandler;
 
-    mapping(uint256 intentId => bool exists) public doesIntentExist;
+    mapping(uint256 intentId => Intent intent) public pendingIntents;
+
+    modifier onlyIBC() {
+        if (ibcHandler != msg.sender) {
+            revert ZkgmLib.ErrNotIBC();
+        }
+        _;
+    }
 
     constructor(
         IWETH9 _wrappedNativeToken,
-        IBCHandler _ibcHandler,
-        uint64 _timeout,
-        bytes memory _targetContract
-    ) BridgeTestMessenger(_ibcHandler, _timeout) Ownable(msg.sender) {
+        address _ibcHandler
+    ) Ownable(msg.sender) {
         WETH = _wrappedNativeToken;
+        ibcHandler = _ibcHandler;
+    }
+
+    function setContractAddresses(
+        bytes memory _targetContract,
+        bytes memory _sourceContract
+    ) external onlyOwner {
         targetContract = _targetContract;
+        sourceContract = _sourceContract;
     }
 
     function bridge(
@@ -88,12 +102,12 @@ contract BridgeTest is BridgeTestInterface, BridgeTestMessenger, Ownable {
             );
         }
 
-        doesIntentExist[id] = true;
+        pendingIntents[intent.id] = intent;
 
         emit IntentCreated(intent);
     }
 
-    function fulfill(Intent calldata intent) external payable {
+    function fulfill(Intent calldata intent, uint32 channelId) external payable {
         if (intent.relayer != msg.sender) {
             revert UnauthorizedRelayer();
         }
@@ -111,30 +125,39 @@ contract BridgeTest is BridgeTestInterface, BridgeTestMessenger, Ownable {
             );
         }
 
-        doesIntentExist[intent.id] = true;
-
         emit IntentFulfilled(intent);
 
         // Convert storage bytes to memory before passing
         bytes memory targetContractCopy = targetContract;
-        ZkgmLib.sendZkgmMessage(targetContractCopy, intent.id);
+        ZkgmLib.sendZkgmMessage(channelId, targetContractCopy, intent.id);
     }
 
     function onRecvPacket(
         IBCPacket calldata packet,
         address relayer,
         bytes calldata relayerMsg
-    ) external virtual override onlyIBC returns (bytes memory acknowledgement) {
-        IntentPacket memory pp = BridgeMessengerLib.decode(packet.data);
+    ) external onlyIBC returns (bytes memory) {
+        (bytes memory senderBytes, bytes memory messageData) = abi.decode(
+            packet.data,
+            (bytes, bytes)
+        );
 
-        if (!doesIntentExist[pp.intent.id]) {
-            return abi.encodePacked(BridgeMessengerLib.ACK_FAILURE);
+        if(ZkgmLib.bytesEqual(senderBytes, sourceContract)) {
+            revert ZkgmLib.ErrInvalidMultiplexSender();
         }
 
-        _repay(pp.intent);
+        uint256 intentId = abi.decode(messageData, (uint256));
 
-        // Return protocol specific successful acknowledgement
-        return abi.encodePacked(BridgeMessengerLib.ACK_SUCCESS);
+        Intent storage intent = pendingIntents[intentId];
+        if (intent.sender == address(0)) {
+            return abi.encode(ZkgmLib.ACK_FAILURE);
+        }
+
+        _repay(intent);
+
+        delete pendingIntents[intentId];
+
+        return abi.encode(ZkgmLib.ACK_SUCCESS);
     }
 
     // ADMIN FUNCTIONS
@@ -178,8 +201,6 @@ contract BridgeTest is BridgeTestInterface, BridgeTestMessenger, Ownable {
         }
 
         emit IntentRepaid(intent);
-
-        doesIntentExist[intent.id] = false; // delete the intent
     }
 
     receive() external payable {}

@@ -24,11 +24,47 @@ interface IZkgm {
 library ZkgmLib {
     // Protocol version constant
     uint8 public constant ZKGM_VERSION_0 = 0x00;
-    // Opcode constant for the multiplex operation
-    uint8 public constant OP_MULTIPLEX = 0x01;
 
     address public constant ZKGM_ADDRESS =
         0x7B7872fEc715C787A1BE3f062AdeDc82b3B06144;
+
+    uint256 public constant ACK_FAILURE = 0x00;
+    uint256 public constant ACK_SUCCESS = 0x01;
+    bytes public constant ACK_EMPTY = hex"";
+
+    bytes public constant ACK_ERR_ONLYMAKER = hex"DEADC0DE";
+
+    uint256 public constant FILL_TYPE_PROTOCOL = 0xB0CAD0;
+    uint256 public constant FILL_TYPE_MARKETMAKER = 0xD1CEC45E;
+
+    uint8 public constant OP_FORWARD = 0x00;
+    uint8 public constant OP_MULTIPLEX = 0x01;
+    uint8 public constant OP_BATCH = 0x02;
+    uint8 public constant OP_FUNGIBLE_ASSET_ORDER = 0x03;
+
+    uint8 public constant INSTR_VERSION_0 = 0x00;
+    uint8 public constant INSTR_VERSION_1 = 0x01;
+
+    bytes32 public constant IBC_VERSION = keccak256("ucs03-zkgm-0");
+
+    error ErrUnsupportedVersion();
+    error ErrUnimplemented();
+    error ErrBatchMustBeSync();
+    error ErrUnknownOpcode();
+    error ErrInfiniteGame();
+    error ErrUnauthorized();
+    error ErrInvalidAmount();
+    error ErrOnlyMaker();
+    error ErrInvalidFillType();
+    error ErrInvalidIBCVersion();
+    error ErrInvalidHops();
+    error ErrInvalidAssetOrigin();
+    error ErrInvalidAssetSymbol();
+    error ErrInvalidAssetDecimals();
+    error ErrInvalidAssetName();
+    error ErrInvalidBatchInstruction();
+    error ErrInvalidMultiplexSender();
+    error ErrNotIBC();
 
     /**
      * @notice Structure representing a multiplex message payload.
@@ -53,7 +89,7 @@ library ZkgmLib {
     struct ZkgmPacket {
         bytes32 salt;
         uint256 path;
-        IZkgm.Instruction instruction;  // Use IZkgm.Instruction here
+        IZkgm.Instruction instruction; // Use IZkgm.Instruction here
     }
 
     event MessageSent(
@@ -90,49 +126,12 @@ library ZkgmLib {
         return abi.encode(packet.salt, packet.path, packet.instruction);
     }
 
-    /**
-     * @dev Decodes a ZkgmPacket from bytes
-     * @param data The bytes to decode
-     * @return packet The decoded ZkgmPacket structure
-     */
-    function decodeZkgmPacket(
-        bytes memory data
-    ) internal pure returns (ZkgmPacket memory packet) {
-        (packet.salt, packet.path, packet.instruction) = abi.decode(
-            data,
-            (bytes32, uint256, IZkgm.Instruction)
-        );
-    }
-
-    /**
-     * @dev Decodes a Multiplex from bytes
-     * @param data The bytes to decode
-     * @return multiplex The decoded Multiplex structure
-     */
-    function decodeMultiplex(
-        bytes memory data
-    ) internal pure returns (Multiplex memory multiplex) {
-        (
-            multiplex.sender,
-            multiplex.eureka,
-            multiplex.contractAddress,
-            multiplex.contractCalldata
-        ) = abi.decode(data, (bytes, bool, bytes, bytes));
-    }
-
-    /**
-     * @dev Decodes an Instruction from bytes
-     * @param data The bytes to decode
-     * @return instruction The decoded Instruction structure
-     */
-    function decodeInstruction(
-        bytes memory data
-    ) internal pure returns (IZkgm.Instruction memory instruction) {
-        (instruction.version, instruction.opcode, instruction.operand) = abi
-            .decode(data, (uint8, uint8, bytes));
+    function bytesEqual(bytes memory a, bytes memory b) internal pure returns (bool) {
+        return (a.length == b.length) && (keccak256(a) == keccak256(b));
     }
 
     function sendZkgmMessage(
+        uint32 channelId,
         bytes memory targetContractAddress,
         uint256 id
     ) internal {
@@ -143,7 +142,7 @@ library ZkgmLib {
             contractCalldata: abi.encode(id)
         });
         bytes memory multiplexEncoded = encodeMultiplex(multiplexData);
-        IZkgm.Instruction memory instruction = IZkgm.Instruction({  // Use IZkgm.Instruction here
+        IZkgm.Instruction memory instruction = IZkgm.Instruction({ // Use IZkgm.Instruction here
             version: ZKGM_VERSION_0,
             opcode: OP_MULTIPLEX,
             operand: multiplexEncoded
@@ -156,7 +155,7 @@ library ZkgmLib {
 
         try
             IZkgm(ZKGM_ADDRESS).send(
-                47, // Channel ID (Holesky -> Sepolia)
+                channelId, // Channel ID (Holesky -> Sepolia)
                 0, // timeoutHeight
                 18446744073709551500, // timeoutTimestamp
                 packet.salt,
@@ -164,7 +163,7 @@ library ZkgmLib {
             )
         {
             emit MessageSent(
-                9,
+                channelId,
                 address(bytes20(targetContractAddress)),
                 "Message Sent"
             );
