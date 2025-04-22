@@ -133,6 +133,7 @@ contract BridgeTest is BridgeTestInterface, Ownable {
     }
 
     function onRecvPacket(
+        address caller,
         IBCPacket calldata packet,
         address relayer,
         bytes calldata relayerMsg

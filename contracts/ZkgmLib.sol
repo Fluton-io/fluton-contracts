@@ -26,7 +26,7 @@ library ZkgmLib {
     uint8 public constant ZKGM_VERSION_0 = 0x00;
 
     address public constant ZKGM_ADDRESS =
-        0x7B7872fEc715C787A1BE3f062AdeDc82b3B06144;
+        0x5FbE74A283f7954f10AA04C2eDf55578811aeb03;
 
     uint256 public constant ACK_FAILURE = 0x00;
     uint256 public constant ACK_SUCCESS = 0x01;
