@@ -1,52 +1,147 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
 import "@uniswap/universal-router/contracts/interfaces/external/IWETH9.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-
-import "./BridgeTestMessenger.sol";
-import "./BridgeTestInterface.sol";
-import "./union/apps/Base.sol";
-
 import "./ZkgmLib.sol";
 
 /**
  * @title BridgeTest
- * @notice This contract is only for testing purposes and does not represent the actual Bridge contract. Therefore, it is not advised to use it in production.
+ * @notice Test contract for cross-chain message bridging; not for production use.
  */
-contract BridgeTest is BridgeTestInterface, Ownable {
-    IWETH9 public immutable WETH;
+contract BridgeTest is Ownable {
     using ZkgmLib for *;
-    uint256 public fee = 100; // 1%
-    address public feeReceiver = 0xBdc3f1A02e56CD349d10bA8D2B038F774ae22731;
-    bytes public targetContract;
-    bytes public sourceContract;
+
+    /*///////////////////////////////////////////////////////////////
+                              STRUCTS & ENUMS
+    //////////////////////////////////////////////////////////////*/
+
+    enum FilledStatus {
+        NOT_FILLED,
+        FILLED
+    }
+
+    struct Intent {
+        address sender;
+        address receiver;
+        address relayer;
+        address inputToken;
+        address outputToken;
+        uint256 inputAmount;
+        uint256 outputAmount;
+        uint256 id;
+        uint32 originChainId;
+        uint32 destinationChainId;
+        FilledStatus filledStatus;
+    }
+
+    struct IBCPacket {
+        uint32 sourceChannelId;
+        uint32 destinationChannelId;
+        bytes data;
+        uint64 timeoutHeight;
+        uint64 timeoutTimestamp;
+    }
+
+    /*///////////////////////////////////////////////////////////////
+                              STATE VARIABLES
+    //////////////////////////////////////////////////////////////*/
+
+    IWETH9 public immutable WETH;
+    uint256 public fee = 100; // 1% in basis points
+    address public feeReceiver;
     address public ibcHandler;
 
-    mapping(uint256 intentId => Intent intent) public pendingIntents;
+    mapping(uint256 => Intent) public pendingIntents;
+    mapping(bytes32 => bool) public validPaths;
+
+    /*///////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event IntentCreated(Intent intent);
+    event IntentFulfilled(Intent intent);
+    event IntentRepaid(Intent intent);
+    event IntentTimedOut(uint256 intentId);
+
+    /*///////////////////////////////////////////////////////////////
+                                ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    error MsgValueDoesNotMatchInputAmount();
+    error UnauthorizedRelayer();
+
+    /*///////////////////////////////////////////////////////////////
+                               MODIFIERS
+    //////////////////////////////////////////////////////////////*/
 
     modifier onlyIBC() {
-        if (ibcHandler != msg.sender) {
-            revert ZkgmLib.ErrNotIBC();
-        }
+        if (msg.sender != ibcHandler) revert ZkgmLib.ErrNotIBC();
         _;
     }
 
+    /*///////////////////////////////////////////////////////////////
+                             CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    /// @param _wrappedNativeToken Address of WETH9 token
+    /// @param _ibcHandler Address of the IBC handler contract
     constructor(
         IWETH9 _wrappedNativeToken,
         address _ibcHandler
     ) Ownable(msg.sender) {
         WETH = _wrappedNativeToken;
         ibcHandler = _ibcHandler;
+        feeReceiver = 0xBdc3f1A02e56CD349d10bA8D2B038F774ae22731;
     }
 
-    function setContractAddresses(
-        bytes memory _targetContract,
-        bytes memory _sourceContract
+    /*///////////////////////////////////////////////////////////////
+                         OWNER-ONLY FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Add a valid path mapping between a source contract and a destination contract
+    function addValidPath(
+        bytes calldata sourceContract,
+        bytes calldata destContract
     ) external onlyOwner {
-        targetContract = _targetContract;
-        sourceContract = _sourceContract;
+        bytes32 key = keccak256(abi.encodePacked(sourceContract, destContract));
+        validPaths[key] = true;
     }
 
+    /// @notice Remove an existing valid path mapping between a source contract and a destination contract
+    function removeValidPath(
+        bytes calldata sourceContract,
+        bytes calldata destContract
+    ) external onlyOwner {
+        bytes32 key = keccak256(abi.encodePacked(sourceContract, destContract));
+        delete validPaths[key];
+    }
+
+    /// @notice Adjust the bridging fee (in basis points)
+    function setFee(uint256 _fee) external onlyOwner {
+        fee = _fee;
+    }
+
+    /// @notice Change the fee recipient address
+    function setFeeReceiver(address _feeReceiver) external onlyOwner {
+        feeReceiver = _feeReceiver;
+    }
+
+    /*///////////////////////////////////////////////////////////////
+                            CORE FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Create a bridge intent and lock funds
+     * @param sender Address initiating the bridge
+     * @param receiver Address on destination chain
+     * @param relayer Relayer address authorized to fulfill
+     * @param inputToken Token to lock
+     * @param outputToken Token to release on destination
+     * @param inputAmount Amount to lock
+     * @param outputAmount Amount to release
+     * @param destinationChainId Destination Chain ID
+     */
     function bridge(
         address sender,
         address receiver,
@@ -87,14 +182,11 @@ contract BridgeTest is BridgeTestInterface, Ownable {
             filledStatus: FilledStatus.NOT_FILLED
         });
 
-        if (intent.inputToken == address(WETH) && msg.value > 0) {
-            if (msg.value != intent.inputAmount) {
+        if (intent.inputToken == address(WETH)) {
+            if (msg.value != intent.inputAmount)
                 revert MsgValueDoesNotMatchInputAmount();
-            }
-            // if the input token is WETH, deposit the amount to the contract
             WETH.deposit{value: msg.value}();
         } else {
-            // if the input token is not WETH, transfer the amount from the sender to the contract (lock)
             IERC20(intent.inputToken).transferFrom(
                 msg.sender,
                 address(this),
@@ -102,101 +194,195 @@ contract BridgeTest is BridgeTestInterface, Ownable {
             );
         }
 
-        pendingIntents[intent.id] = intent;
-
+        pendingIntents[id] = intent;
         emit IntentCreated(intent);
     }
 
-    function fulfill(Intent calldata intent, uint32 channelId) external payable {
-        if (intent.relayer != msg.sender) {
-            revert UnauthorizedRelayer();
-        }
+    /**
+     * @notice Locks a user’s base tokens and sends a 0x03 – FungibleAssetOrder packet via Union ZKGM
+     * @param receiver        Address on the destination chain that will receive the output
+     * @param baseToken       Address of the token to lock on this chain
+     * @param baseAmount      Amount of baseToken to lock
+     * @param baseSymbol      Symbol of the base token (for wrapped-token metadata)
+     * @param baseName        Name of the base token (for wrapped-token metadata)
+     * @param baseDecimals    Decimals of the base token (for wrapped-token metadata)
+     * @param quoteToken      Identifier of the token requested on the destination chain (as bytes)
+     * @param quoteAmount     Minimum amount of quoteToken requested
+     * @param channelID  IBC channel ID / target chain identifier
+     */
+    function bridgeAssetOrder(
+        address receiver,
+        address baseToken,
+        uint256 baseAmount,
+        string calldata baseSymbol,
+        string calldata baseName,
+        uint8 baseDecimals,
+        uint256 baseTokenPath,
+        bytes calldata quoteToken,
+        uint256 quoteAmount,
+        uint32 channelID,
+        bytes calldata targetContract
+    ) external payable {
+        ZkgmLib.FungibleAssetOrder memory order = ZkgmLib.FungibleAssetOrder({
+            sender: abi.encodePacked(msg.sender),
+            receiver: abi.encodePacked(receiver),
+            baseToken: abi.encodePacked(baseToken),
+            baseAmount: baseAmount,
+            baseTokenSymbol: baseSymbol,
+            baseTokenName: baseName,
+            baseTokenDecimals: baseDecimals,
+            baseTokenPath: baseTokenPath,
+            quoteToken: quoteToken,
+            quoteAmount: quoteAmount
+        });
 
-        if (intent.outputToken == address(WETH) && msg.value > 0) {
-            // if the output token is WETH, transfer the amount from the contract to the receiver
-            payable(address(this)).transfer(intent.outputAmount);
-            // transfer the amount to the receiver
-            payable(intent.receiver).transfer(intent.outputAmount);
+        IERC20(baseToken).approve(ZkgmLib.ZKGM_ADDRESS, baseAmount);
+
+        ZkgmLib.sendZkgmAssetOrder(channelID, targetContract, order);
+    }
+
+    /**
+     * @notice Relayer fulfills the intent and sends cross-chain message
+     * @param intent Data describing the bridge intent
+     * @param channelId IBC channel identifier
+     */
+    function fulfill(
+        Intent calldata intent,
+        uint32 channelId,
+        bytes calldata targetContract
+    ) external payable {
+        if (msg.sender != intent.relayer) revert UnauthorizedRelayer();
+
+        if (intent.outputToken == address(WETH)) {
+            // Aşağıdaki gibi yapıyoruz:
+            _sendWETH(intent.receiver, intent.outputAmount);
         } else {
-            // if the input token is not WETH, transfer the amount from the contract to the receiver
-            IERC20(intent.outputToken).transfer(
+            IERC20(intent.outputToken).transferFrom(
+                intent.relayer,
                 intent.receiver,
                 intent.outputAmount
             );
         }
 
         emit IntentFulfilled(intent);
-
-        // Convert storage bytes to memory before passing
-        bytes memory targetContractCopy = targetContract;
-        ZkgmLib.sendZkgmMessage(channelId, targetContractCopy, intent.id);
+        ZkgmLib.sendZkgmMessage(channelId, targetContract, intent.id);
     }
 
+    /**
+     * @notice Relayer fulfills multiple intents atomically and sends a batch cross-chain message
+     */
+    function fulfillBatch(
+        Intent[] calldata intents,
+        uint32 channelId,
+        bytes calldata targetContract
+    ) external payable {
+        uint256 len = intents.length;
+        require(len > 1, "Batch requires at least 2 intents");
+
+        IZkgm.Instruction[] memory instrs = new IZkgm.Instruction[](len);
+        for (uint256 i; i < len; ++i) {
+            Intent calldata intent = intents[i];
+            if (msg.sender != intent.relayer) revert UnauthorizedRelayer();
+
+            if (intent.outputToken == address(WETH)) {
+                _sendWETH(intent.receiver, intent.outputAmount);
+            } else {
+                IERC20(intent.outputToken).transferFrom(
+                    intent.relayer,
+                    intent.receiver,
+                    intent.outputAmount
+                );
+            }
+
+            emit IntentFulfilled(intent);
+
+            ZkgmLib.Multiplex memory mux = ZkgmLib.Multiplex({
+                sender: abi.encodePacked(address(this)),
+                eureka: true,
+                contractAddress: targetContract,
+                contractCalldata: abi.encode(intent.id)
+            });
+
+            bytes memory data = ZkgmLib.encodeMultiplex(mux);
+
+            instrs[i] = IZkgm.Instruction({
+                version: ZkgmLib.ZKGM_VERSION_0,
+                opcode: ZkgmLib.OP_MULTIPLEX,
+                operand: data
+            });
+        }
+
+        ZkgmLib.sendZkgmBatch(channelId, targetContract, instrs);
+    }
+
+    /**
+     * @notice Handles incoming IBC packets for repayment
+     */
     function onRecvPacket(
-        address caller,
+        address /*caller*/,
         IBCPacket calldata packet,
-        address relayer,
-        bytes calldata relayerMsg
+        address /*relayer*/,
+        bytes calldata /*relayerMsg*/
     ) external onlyIBC returns (bytes memory) {
-        (bytes memory senderBytes, bytes memory messageData) = abi.decode(
+        (, bytes memory senderBytes, bytes memory messageData) = abi.decode(
             packet.data,
-            (bytes, bytes)
+            (uint256, bytes, bytes)
         );
 
-        if(ZkgmLib.bytesEqual(senderBytes, sourceContract)) {
+        bytes32 pathKey = keccak256(abi.encodePacked(abi.encode(address(this)), senderBytes));
+
+        if (!validPaths[pathKey]) {
             revert ZkgmLib.ErrInvalidMultiplexSender();
         }
 
         uint256 intentId = abi.decode(messageData, (uint256));
-
         Intent storage intent = pendingIntents[intentId];
         if (intent.sender == address(0)) {
             return abi.encode(ZkgmLib.ACK_FAILURE);
         }
 
         _repay(intent);
-
         delete pendingIntents[intentId];
-
         return abi.encode(ZkgmLib.ACK_SUCCESS);
     }
 
-    // ADMIN FUNCTIONS
-    function setFee(uint256 _fee) external onlyOwner {
-        fee = _fee;
+    function onTimeoutPacket(
+        address /*caller*/,
+        IBCPacket calldata packet,
+        address /*relayer*/,
+    ) external onlyIBC returns (bytes memory) {
+        (, bytes memory senderBytes, bytes memory messageData) = abi.decode(
+            packet.data,
+            (uint256, bytes, bytes)
+        );
+
+        uint256 intentId = abi.decode(messageData, (uint256));
+        
+        emit IntentTimedOut(intentId);
     }
 
-    function setFeeReceiver(address _feeReceiver) external onlyOwner {
-        feeReceiver = _feeReceiver;
+    /*///////////////////////////////////////////////////////////////
+                         INTERNAL UTILITIES
+    //////////////////////////////////////////////////////////////*/
+
+    function _sendWETH(address to, uint256 amount) internal {
+        // unwrap and transfer
+        WETH.withdraw(amount);
+        payable(to).transfer(amount);
     }
 
-    // INTERNAL FUNCTIONS
     function _repay(Intent memory intent) internal {
-        // take fee
         uint256 feeAmount = (intent.inputAmount * fee) / 10000;
         uint256 repayAmount = intent.inputAmount - feeAmount;
 
         if (intent.inputToken == address(WETH)) {
-            // if the input token is WETH, transfer the amount from the contract to the sender
-
-            // unwrap if contract has WETH
-            try WETH.withdraw(repayAmount) {} catch {}
-            payable(intent.relayer).transfer(repayAmount);
+            _sendWETH(intent.relayer, repayAmount);
+            if (feeAmount > 0) {
+                _sendWETH(feeReceiver, feeAmount);
+            }
         } else {
-            // if the input token is not WETH, transfer the amount from the contract to the sender
             IERC20(intent.inputToken).transfer(intent.relayer, repayAmount);
-        }
-
-        // transfer fee to fee receiver
-        if (feeAmount > 0) {
-            if (intent.inputToken == address(WETH)) {
-                // if the input token is WETH, transfer the amount from the contract to the fee receiver
-
-                // unwrap if contract has WETH
-                try WETH.withdraw(feeAmount) {} catch {}
-                payable(feeReceiver).transfer(feeAmount);
-            } else {
-                // if the input token is not WETH, transfer the amount from the contract to the fee receiver
+            if (feeAmount > 0) {
                 IERC20(intent.inputToken).transfer(feeReceiver, feeAmount);
             }
         }
@@ -204,5 +390,8 @@ contract BridgeTest is BridgeTestInterface, Ownable {
         emit IntentRepaid(intent);
     }
 
+    /*///////////////////////////////////////////////////////////////
+                           FALLBACK RECEIVER
+    //////////////////////////////////////////////////////////////*/
     receive() external payable {}
 }

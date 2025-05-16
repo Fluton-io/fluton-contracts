@@ -7,7 +7,6 @@ interface IZkgm {
         uint8 opcode;
         bytes operand;
     }
-
     function send(
         uint32 channelId,
         uint64 timeoutHeight,
@@ -19,60 +18,25 @@ interface IZkgm {
 
 /**
  * @title ZkgmLib
- * @notice A minimal library for encoding cross-chain messages for the Zkgm protocol.
+ * @notice Library to encode and send cross-chain messages via Zkgm protocol
  */
 library ZkgmLib {
-    // Protocol version constant
     uint8 public constant ZKGM_VERSION_0 = 0x00;
-
-    address public constant ZKGM_ADDRESS =
-        0x5FbE74A283f7954f10AA04C2eDf55578811aeb03;
-
+    uint8 public constant INSTR_VERSION_1 = 0x01;
+    address public constant ZKGM_ADDRESS = 0x5FbE74A283f7954f10AA04C2eDf55578811aeb03;
     uint256 public constant ACK_FAILURE = 0x00;
     uint256 public constant ACK_SUCCESS = 0x01;
-    bytes public constant ACK_EMPTY = hex"";
-
-    bytes public constant ACK_ERR_ONLYMAKER = hex"DEADC0DE";
-
-    uint256 public constant FILL_TYPE_PROTOCOL = 0xB0CAD0;
-    uint256 public constant FILL_TYPE_MARKETMAKER = 0xD1CEC45E;
-
-    uint8 public constant OP_FORWARD = 0x00;
     uint8 public constant OP_MULTIPLEX = 0x01;
     uint8 public constant OP_BATCH = 0x02;
     uint8 public constant OP_FUNGIBLE_ASSET_ORDER = 0x03;
 
-    uint8 public constant INSTR_VERSION_0 = 0x00;
-    uint8 public constant INSTR_VERSION_1 = 0x01;
-
-    bytes32 public constant IBC_VERSION = keccak256("ucs03-zkgm-0");
-
-    error ErrUnsupportedVersion();
-    error ErrUnimplemented();
-    error ErrBatchMustBeSync();
-    error ErrUnknownOpcode();
-    error ErrInfiniteGame();
-    error ErrUnauthorized();
-    error ErrInvalidAmount();
-    error ErrOnlyMaker();
-    error ErrInvalidFillType();
-    error ErrInvalidIBCVersion();
-    error ErrInvalidHops();
-    error ErrInvalidAssetOrigin();
-    error ErrInvalidAssetSymbol();
-    error ErrInvalidAssetDecimals();
-    error ErrInvalidAssetName();
-    error ErrInvalidBatchInstruction();
-    error ErrInvalidMultiplexSender();
     error ErrNotIBC();
+    error ErrInvalidMultiplexSender();
 
-    /**
-     * @notice Structure representing a multiplex message payload.
-     * @param sender The sender's address encoded as bytes.
-     * @param eureka Flag indicating whether Eureka mode is enabled.
-     * @param contractAddress The target contract address on the destination chain.
-     * @param contractCalldata The calldata to be executed on the target contract.
-     */
+    struct Batch {
+        IZkgm.Instruction[] instructions;
+    }
+
     struct Multiplex {
         bytes sender;
         bool eureka;
@@ -80,54 +44,53 @@ library ZkgmLib {
         bytes contractCalldata;
     }
 
-    /**
-     * @notice Structure representing a Zkgm packet to be sent cross-chain.
-     * @param salt Unique salt for the packet.
-     * @param path The channel path (for routing), can be 0 for default.
-     * @param instruction The instruction to be executed on the destination.
-     */
+    struct FungibleAssetOrder {
+        bytes  sender;
+        bytes  receiver;
+        bytes  baseToken;
+        uint256 baseAmount;
+        string baseTokenSymbol;
+        string baseTokenName;
+        uint8  baseTokenDecimals;
+        uint256 baseTokenPath;
+        bytes  quoteToken;
+        uint256 quoteAmount;
+    }
+
     struct ZkgmPacket {
         bytes32 salt;
         uint256 path;
-        IZkgm.Instruction instruction; // Use IZkgm.Instruction here
+        IZkgm.Instruction instruction;
     }
 
-    event MessageSent(
-        uint256 indexed channelId,
-        address indexed sender,
-        string message
-    );
+    event MessageSent(uint256 indexed channelId, address indexed sender, string message);
 
-    /**
-     * @notice Encodes a Multiplex structure into ABI-encoded bytes.
-     * @param multiplex The Multiplex structure to encode.
-     * @return The encoded bytes representing the multiplex payload.
-     */
-    function encodeMultiplex(
-        Multiplex memory multiplex
-    ) internal pure returns (bytes memory) {
-        return
-            abi.encode(
-                multiplex.sender,
-                multiplex.eureka,
-                multiplex.contractAddress,
-                multiplex.contractCalldata
-            );
+    function encodeMultiplex(Multiplex memory m) internal pure returns (bytes memory) {
+        return abi.encode(m.sender, m.eureka, m.contractAddress, m.contractCalldata);
     }
 
-    /**
-     * @notice Encodes a ZkgmPacket structure into ABI-encoded bytes.
-     * @param packet The ZkgmPacket structure to encode.
-     * @return The encoded bytes representing the Zkgm packet.
-     */
-    function encode(
-        ZkgmPacket memory packet
-    ) internal pure returns (bytes memory) {
-        return abi.encode(packet.salt, packet.path, packet.instruction);
+    /// @notice ABI-encode a batch of instructions
+    function encodeBatch(IZkgm.Instruction[] memory instrs) internal pure returns (bytes memory) {
+        return abi.encode(instrs);
+    }
+
+    function encodeFungibleAssetOrder(FungibleAssetOrder memory o) internal pure returns (bytes memory) {
+        return abi.encode(
+            o.sender,
+            o.receiver,
+            o.baseToken,
+            o.baseAmount,
+            o.baseTokenSymbol,
+            o.baseTokenName,
+            o.baseTokenDecimals,
+            o.baseTokenPath,
+            o.quoteToken,
+            o.quoteAmount
+        );
     }
 
     function bytesEqual(bytes memory a, bytes memory b) internal pure returns (bool) {
-        return (a.length == b.length) && (keccak256(a) == keccak256(b));
+        return a.length == b.length && keccak256(a) == keccak256(b);
     }
 
     function sendZkgmMessage(
@@ -135,41 +98,82 @@ library ZkgmLib {
         bytes memory targetContractAddress,
         uint256 id
     ) internal {
-        Multiplex memory multiplexData = Multiplex({
+        Multiplex memory mux = Multiplex({
             sender: abi.encodePacked(address(this)),
-            eureka: false,
+            eureka: true,
             contractAddress: targetContractAddress,
             contractCalldata: abi.encode(id)
         });
-        bytes memory multiplexEncoded = encodeMultiplex(multiplexData);
-        IZkgm.Instruction memory instruction = IZkgm.Instruction({ // Use IZkgm.Instruction here
+        bytes memory data = encodeMultiplex(mux);
+        IZkgm.Instruction memory instr = IZkgm.Instruction({
             version: ZKGM_VERSION_0,
             opcode: OP_MULTIPLEX,
-            operand: multiplexEncoded
+            operand: data
         });
-        ZkgmPacket memory packet = ZkgmPacket({
-            salt: keccak256(abi.encodePacked(block.timestamp)),
-            path: 0,
-            instruction: instruction
-        });
+        bytes32 salt = keccak256(abi.encodePacked(block.timestamp));
 
-        try
-            IZkgm(ZKGM_ADDRESS).send(
-                channelId, // Channel ID (Holesky -> Sepolia)
-                0, // timeoutHeight
-                18446744073709551500, // timeoutTimestamp
-                packet.salt,
-                instruction
-            )
-        {
-            emit MessageSent(
-                channelId,
-                address(bytes20(targetContractAddress)),
-                "Message Sent"
-            );
+        try IZkgm(ZKGM_ADDRESS).send(
+            channelId,
+            0,
+            18446744073709551500,
+            salt,
+            instr
+        ) {
+            emit MessageSent(channelId, address(bytes20(targetContractAddress)), "Message Sent");
         } catch Error(string memory reason) {
             revert(string(abi.encodePacked("Zkgm send failed: ", reason)));
-        } catch (bytes memory) {
+        } catch {
+            revert("Zkgm send failed with low level error");
+        }
+    }
+
+    /// @notice Send a batch instruction via Zkgm
+    function sendZkgmBatch(
+        uint32 channelId,
+        bytes memory targetContractAddress,
+        IZkgm.Instruction[] memory instrs
+    ) internal {
+        IZkgm.Instruction memory batchInstr = IZkgm.Instruction({
+            version: ZKGM_VERSION_0,
+            opcode: OP_BATCH,
+            operand: encodeBatch(instrs)
+        });
+        _sendPacket(channelId, batchInstr, targetContractAddress, "Batch Message Sent");
+    }
+
+    /// @notice Send a single fungible-asset-order
+    function sendZkgmAssetOrder(
+        uint32 channelId,
+        bytes memory targetContractAddress,
+        FungibleAssetOrder memory order
+    ) internal {
+        IZkgm.Instruction memory instr = IZkgm.Instruction({
+            version: INSTR_VERSION_1,
+            opcode:  OP_FUNGIBLE_ASSET_ORDER,
+            operand: encodeFungibleAssetOrder(order)
+        });
+        _sendPacket(channelId, instr, targetContractAddress, "AssetOrder Sent");
+    }
+
+    /// @dev Internal helper to dispatch a packet
+    function _sendPacket(
+        uint32 channelId,
+        IZkgm.Instruction memory instr,
+        bytes memory targetContractAddress,
+        string memory successMsg
+    ) private {
+        bytes32 salt = keccak256(abi.encodePacked(block.timestamp));
+        try IZkgm(ZKGM_ADDRESS).send(
+            channelId,
+            0,
+            18446744073709551500,
+            salt,
+            instr
+        ) {
+            emit MessageSent(channelId, address(bytes20(targetContractAddress)), successMsg);
+        } catch Error(string memory reason) {
+            revert(string(abi.encodePacked("Zkgm send failed: ", reason)));
+        } catch {
             revert("Zkgm send failed with low level error");
         }
     }
