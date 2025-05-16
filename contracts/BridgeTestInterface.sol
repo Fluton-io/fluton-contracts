@@ -40,7 +40,7 @@ interface BridgeTestInterface {
         uint32 destinationChainId
     ) external payable;
 
-    function fulfill(Intent calldata intent) external payable;
+    function fulfill(Intent calldata intent, uint32 channelId) external payable;
 
     // ERRORS
     error MsgValueDoesNotMatchInputAmount();
